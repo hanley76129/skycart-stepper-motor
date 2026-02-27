@@ -1,88 +1,109 @@
-#include <Arduino.h>
-#include <ESP32_Servo.h>
-#include <FastAccelStepper.h>
-#include <HardwareSerial.h>
+#include <HardwareSerial.h> //unused
+#include <ESP32_Servo.h> //unused
 
+#include <Arduino.h>
+#include <FastAccelStepper.h>
+#include <cmath>
 
 #define STEP_PIN 26
 #define DIR_PIN 25
 #define ENABLE_PIN 27
 
 FastAccelStepperEngine engine;
-FastAccelStepper *stepper = nullptr;
+FastAccelStepper* stepper = nullptr;
 
-// Stepper move targets
-long forwardTarget = 10000;
-long backwardTarget = -10000;
+const float microsteps_per_inch = 10160.0f;
 
 // State variables
 bool isMovingForward = false;
 bool isMovingBackward = false;
 
+long inchesToSteps(float inches) {
+  return lround(inches * microsteps_per_inch);
+}
+
 void handleCommand(char cmd) {
-  if (!stepper)
+  if (!stepper) {
     return;
+  }
 
   switch (cmd) {
-  case 49: // Move forward
-    if (isMovingBackward) {
-      // Force stop before reversing direction
-      stepper->stopMove();
-      isMovingBackward = false;
-      Serial.println("Motor stopped to reverse direction.");
-    }
+    case '1':  // Move forward
+      if (isMovingBackward) {
+        // Force stop before reversing direction
+        stepper->forceStop();
+        isMovingBackward = false;
+        Serial.println("Motor stopped to reverse direction.");
+      }
 
-    if (!stepper->isRunning()) {
-      stepper->runForward();
-      isMovingForward = true;
-      Serial.println("Moving forward...");
-    }
-    break;
+      if (!stepper->isRunning()) {
+        stepper->runForward();
+        isMovingForward = true;
+        Serial.println("Moving forward...");
+      }
+      break;
 
-  case 50: // Move backward
-    if (isMovingForward) {
-      // Force stop before reversing direction
-      stepper->stopMove();
+    case '2':  // Move backward
+      if (isMovingForward) {
+        // Force stop before reversing direction
+        stepper->forceStop();
+        isMovingForward = false;
+        Serial.println("Motor stopped to reverse direction.");
+      }
+
+      if (!stepper->isRunning()) {
+        stepper->runBackward();
+        isMovingBackward = true;
+        Serial.println("Moving backward...");
+      }
+      break;
+
+    case '3':  // Stop stepper safely
+      if (stepper->isRunning()) {
+        stepper->forceStop();
+        isMovingForward = false;
+        isMovingBackward = false;
+        Serial.println("Stepper stopped.");
+      }
+      break;
+
+    case '4':  // Enable motor
+      stepper->enableOutputs();
+      Serial.println("Stepper enabled.");
+      break;
+
+    case '5':  // Disable motor
+      stepper->disableOutputs();  // Turn off (release coils, avoid heat)
       isMovingForward = false;
-      Serial.println("Motor stopped to reverse direction.");
-    }
-
-    if (!stepper->isRunning()) {
-      stepper->runBackward();
-      isMovingBackward = true;
-      Serial.println("Moving backward...");
-    }
-    break;
-
-  case 51: // Stop stepper safely
-    if (stepper->isRunning()) {
-      stepper->stopMove();
-      isMovingForward = false;
       isMovingBackward = false;
-      Serial.println("Stepper stopped.");
-    }
-    break;
+      Serial.println("Stepper disabled.");
+      break;
 
-  case 52:                    // Enable motor
-    stepper->enableOutputs(); //
-    Serial.println("Stepper enabled.");
-    break;
+    case '6':  // Move +1 inch
+      if (!stepper->isRunning()) {
+        long steps = inchesToSteps(1);
+        stepper->move(steps);
+        Serial.println("Moving 1 inch...");
+      }
+      break;
 
-  case 53:                     // Disable motor
-    stepper->disableOutputs(); // Turn OFF (release coils, avoid heat)
-    isMovingForward = false;
-    isMovingBackward = false;
-    Serial.println("Stepper disabled.");
-    break;
+    case '7':  // Move -1 inch
+      if (!stepper->isRunning()) {
+        long steps = inchesToSteps(-1);
+        stepper->move(steps);
+        Serial.println("Moving -1 inch...");
+      }
+      break;
 
-  default:
-    Serial.println(
-        "Invalid command. Use 1:Forward 2:Backward 3:Stop 4:Enable 5:Disable");
-    break;
+    default:
+      Serial.println(
+          "Invalid command. Use 1:Forward 2:Backward 3:Stop 4:Enable "
+          "5:Disable 6:+1 inch 7:-1 inch");
+      break;
   }
 
   // Reset states if move finished
-  if (stepper && !stepper->isRunning()) {
+  if (!stepper->isRunning()) {
     isMovingForward = false;
     isMovingBackward = false;
   }
@@ -96,7 +117,7 @@ void setup() {
   // pinMode(DIR_PIN, OUTPUT);
   // pinMode(ENABLE_PIN, OUTPUT);
 
-  // digitalWrite(ENABLE_PIN, LOW); // enable motor at start
+  // digitalWrite(ENABLE_PIN, LOW); // Enable motor at start
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
@@ -107,10 +128,12 @@ void setup() {
 
     stepper->setDelayToEnable(50);
     stepper->setDelayToDisable(50);
+    stepper->setAutoEnable(true);
 
-    stepper->setSpeedInUs(1000);
-    stepper->setAcceleration(1000);
+    stepper->setSpeedInHz(3250);
+    stepper->setAcceleration(3250);
 
+    Serial.println("It moved kinda");
     Serial.println("Stepper initialized successfully.");
   } else {
     Serial.println("Failed to initialize stepper.");
@@ -122,10 +145,5 @@ void loop() {
   if (Serial.available() > 0) {
     char cmd = Serial.read();
     handleCommand(cmd);
-  }
-
-  // Keep stepper running if there’s a move in progress
-  if (stepper && stepper->isRunning()) {
-    stepper->keepRunning();
   }
 }
