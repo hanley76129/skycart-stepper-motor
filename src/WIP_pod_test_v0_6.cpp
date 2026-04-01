@@ -1,147 +1,179 @@
-#include <HardwareSerial.h> //unused
-#include <ESP32_Servo.h> //unused
+/**
+ * Skycart Delivery Rack — Stepper Motor Test Firmware
+ * Platform : ESP32 (PlatformIO)
+ * Library  : FastAccelStepper
+ *
+ * Characterizes leadscrew lift performance under a 42 lb load.
+ * Supports manual speed/direction control over Serial for logging
+ * positional accuracy and validating safe operating limits.
+ *
+ * Key system constants (1/8 microstepping, 4-start 2 mm-pitch leadscrew):
+ *   Lead        : 8.0 mm/rev  (0.3150 in/rev)
+ *   Steps/rev   : 1600  (200 full-steps × 8 microsteps)
+ *   Steps/inch  : ~5080
+ *
+ * Validated results:
+ *   12 V max safe speed : 5,000 Hz  (~0.49 in/s)
+ *   24 V max safe speed : 10,000 Hz (~0.98 in/s)
+ */
 
 #include <Arduino.h>
 #include <FastAccelStepper.h>
-#include <cmath>
 
-#define STEP_PIN 26
-#define DIR_PIN 25
+// ── Pin assignments ──────────────────────────────────────────────────────────
+#define STEP_PIN   26
+#define DIR_PIN    25
 #define ENABLE_PIN 27
 
+// ── Motion constants ─────────────────────────────────────────────────────────
+// 1/8 microstepping: 1600 steps/rev, lead = 0.3150 in/rev → ~5080 steps/in
+// (Simon confirmed 1/8 microstepping for production use)
+static constexpr float STEPS_PER_INCH = 5080.0f;
+
+// Default operating speed — 24 V validated safe limit (10,000 Hz = 0.98 in/s)
+// Lower to 5,000 Hz if running at 12 V.
+static constexpr uint32_t DEFAULT_SPEED_HZ   = 10000;
+static constexpr uint32_t DEFAULT_ACCEL_HZ_S = 3250;
+
+// ── Globals ───────────────────────────────────────────────────────────────────
 FastAccelStepperEngine engine;
-FastAccelStepper* stepper = nullptr;
+FastAccelStepper*      stepper = nullptr;
 
-const float microsteps_per_inch = 10160.0f;
+bool movingForward  = false;
+bool movingBackward = false;
 
-// State variables
-bool isMovingForward = false;
-bool isMovingBackward = false;
-
+// ── Helpers ───────────────────────────────────────────────────────────────────
 long inchesToSteps(float inches) {
-  return lround(inches * microsteps_per_inch);
+  return lround(inches * STEPS_PER_INCH);
 }
 
+void printStatus() {
+  if (!stepper) return;
+  long pos    = stepper->getCurrentPosition();
+  float posIn = (float)pos / STEPS_PER_INCH;
+  Serial.printf("[STATUS] pos = %ld steps (%.4f in) | running = %s\n",
+                pos, posIn, stepper->isRunning() ? "yes" : "no");
+}
+
+// ── Command handler ───────────────────────────────────────────────────────────
 void handleCommand(char cmd) {
-  if (!stepper) {
-    return;
-  }
+  if (!stepper) return;
 
   switch (cmd) {
-    case '1':  // Move forward
-      if (isMovingBackward) {
-        // Force stop before reversing direction
+    case '1':  // Run forward (continuous)
+      if (movingBackward) {
         stepper->forceStop();
-        isMovingBackward = false;
-        Serial.println("Motor stopped to reverse direction.");
+        movingBackward = false;
+        Serial.println("Stopped — reversing to forward.");
       }
-
       if (!stepper->isRunning()) {
         stepper->runForward();
-        isMovingForward = true;
-        Serial.println("Moving forward...");
+        movingForward = true;
+        Serial.println("Running forward...");
       }
       break;
 
-    case '2':  // Move backward
-      if (isMovingForward) {
-        // Force stop before reversing direction
+    case '2':  // Run backward (continuous)
+      if (movingForward) {
         stepper->forceStop();
-        isMovingForward = false;
-        Serial.println("Motor stopped to reverse direction.");
+        movingForward = false;
+        Serial.println("Stopped — reversing to backward.");
       }
-
       if (!stepper->isRunning()) {
         stepper->runBackward();
-        isMovingBackward = true;
-        Serial.println("Moving backward...");
+        movingBackward = true;
+        Serial.println("Running backward...");
       }
       break;
 
-    case '3':  // Stop stepper safely
-      if (stepper->isRunning()) {
-        stepper->forceStop();
-        isMovingForward = false;
-        isMovingBackward = false;
-        Serial.println("Stepper stopped.");
-      }
+    case '3':  // Stop
+      stepper->forceStop();
+      movingForward  = false;
+      movingBackward = false;
+      Serial.println("Motor stopped.");
+      printStatus();
       break;
 
-    case '4':  // Enable motor
+    case '4':  // Enable outputs (energize coils)
       stepper->enableOutputs();
-      Serial.println("Stepper enabled.");
+      Serial.println("Motor enabled.");
       break;
 
-    case '5':  // Disable motor
-      stepper->disableOutputs();  // Turn off (release coils, avoid heat)
-      isMovingForward = false;
-      isMovingBackward = false;
-      Serial.println("Stepper disabled.");
+    case '5':  // Disable outputs — IMPORTANT: prevents thermal runaway at rest
+      stepper->disableOutputs();
+      movingForward  = false;
+      movingBackward = false;
+      Serial.println("Motor disabled (coils de-energized).");
       break;
 
-    case '6':  // Move +1 inch
+    case '6':  // Step +1 inch (used to measure positional accuracy)
       if (!stepper->isRunning()) {
-        long steps = inchesToSteps(1);
-        stepper->move(steps);
-        Serial.println("Moving 1 inch...");
+        stepper->move(inchesToSteps(1.0f));
+        Serial.println("Moving +1.000 inch...");
       }
       break;
 
-    case '7':  // Move -1 inch
+    case '7':  // Step -1 inch
       if (!stepper->isRunning()) {
-        long steps = inchesToSteps(-1);
-        stepper->move(steps);
-        Serial.println("Moving -1 inch...");
+        stepper->move(inchesToSteps(-1.0f));
+        Serial.println("Moving -1.000 inch...");
       }
+      break;
+
+    case '8':  // Zero position reference
+      stepper->setCurrentPosition(0);
+      Serial.println("Position zeroed.");
+      break;
+
+    case '9':  // Print current position and speed
+      printStatus();
       break;
 
     default:
-      Serial.println(
-          "Invalid command. Use 1:Forward 2:Backward 3:Stop 4:Enable "
-          "5:Disable 6:+1 inch 7:-1 inch");
+      Serial.println("Commands: 1=Fwd 2=Bwd 3=Stop 4=Enable 5=Disable"
+                     " 6=+1in 7=-1in 8=Zero 9=Status");
       break;
   }
 
-  // Reset states if move finished
+  // Sync direction flags when motion ends
   if (!stepper->isRunning()) {
-    isMovingForward = false;
-    isMovingBackward = false;
+    movingForward  = false;
+    movingBackward = false;
   }
 }
 
+// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("Stepper Control Setup...");
-
-  // pinMode(STEP_PIN, OUTPUT);
-  // pinMode(DIR_PIN, OUTPUT);
-  // pinMode(ENABLE_PIN, OUTPUT);
-
-  // digitalWrite(ENABLE_PIN, LOW); // Enable motor at start
+  Serial.println("\n=== Skycart Stepper Motor Test Firmware ===");
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
 
-  if (stepper) {
-    stepper->setDirectionPin(DIR_PIN);
-    stepper->setEnablePin(ENABLE_PIN, false);
-
-    stepper->setDelayToEnable(50);
-    stepper->setDelayToDisable(50);
-    stepper->setAutoEnable(true);
-
-    stepper->setSpeedInHz(3250);
-    stepper->setAcceleration(3250);
-
-    Serial.println("It moved kinda");
-    Serial.println("Stepper initialized successfully.");
-  } else {
-    Serial.println("Failed to initialize stepper.");
+  if (!stepper) {
+    Serial.println("ERROR: Failed to initialize stepper. Check STEP_PIN.");
+    return;
   }
+
+  stepper->setDirectionPin(DIR_PIN);
+  stepper->setEnablePin(ENABLE_PIN, /*activeHigh=*/false);
+  stepper->setDelayToEnable(50);
+  stepper->setDelayToDisable(50);
+  stepper->setAutoEnable(true);
+  stepper->setSpeedInHz(DEFAULT_SPEED_HZ);
+  stepper->setAcceleration(DEFAULT_ACCEL_HZ_S);
+
+  Serial.printf("Speed    : %u Hz (%.4f in/s)\n",
+                DEFAULT_SPEED_HZ, (float)DEFAULT_SPEED_HZ / STEPS_PER_INCH);
+  Serial.printf("Accel    : %u Hz/s\n", DEFAULT_ACCEL_HZ_S);
+  Serial.printf("Steps/in : %.1f  (1/8 microstepping)\n", STEPS_PER_INCH);
+  Serial.println("Stepper initialized. Send a command to begin.");
+  Serial.println("Commands: 1=Fwd 2=Bwd 3=Stop 4=Enable 5=Disable"
+                 " 6=+1in 7=-1in 8=Zero 9=Status");
 }
 
+// ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  // Non-blocking serial input
   if (Serial.available() > 0) {
     char cmd = Serial.read();
     handleCommand(cmd);
