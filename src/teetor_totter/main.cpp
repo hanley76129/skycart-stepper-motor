@@ -3,7 +3,7 @@
 // To flash: select "teeter_totter" in the PlatformIO toolbar, then upload.
 
 #include <Arduino.h>
-#include "teeter_totter/teeter_totter.h"
+#include "teeter_totter.h"
 
 void setup() {
   Serial.begin(115200);
