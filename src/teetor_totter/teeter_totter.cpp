@@ -2,43 +2,65 @@
 //  teeter_totter.cpp
 //  Skycart Delivery Rack — Teeter-Totter Balance Firmware
 //
-//  Core idea:
-//    Box masses are known before flight. Using the CG formula,
-//    we compute exactly where each carriage must sit so the
-//    rack's loaded CG lands on the drone's support point.
-//    Motors move once to that position — no sensor needed.
+//  Physical layout (top-down, inches, origin = left edge):
 //
-//  CG formula (rack + boxes):
-//    xcg = (Σ mᵢxᵢ + mᵣxᵣ) / (Σmᵢ + mᵣ)
+//    [motorL]=[pusherL][box0][box1][box2][pusherR]=[motorR]
+//    0"       |  2"   | 6"  | 6"  | 6"  |  2"  |   25"
+//             pL                          pR
 //
-//  Layout (top-down, inches, origin = left edge of rack):
+//  pL = inner face of left pusher  (contacts leftmost box)
+//  pR = inner face of right pusher (contacts rightmost box)
 //
-//    0                      12.5                     25
-//    |——[L carriage]——————————|————————[R carriage]——|
-//          boxes 0,1      support pt      boxes 2,3
+//  3 boxes, each 6" wide along rack axis. Pushers 2" wide.
+//  Boxes slide freely on the rack surface.
+//  Drop hole centered at 12.5" with a two-servo trapdoor.
 //
-//  Loading rule (operator, not firmware):
-//    Heaviest box must be placed nearest center before flight.
+//  Compressed stack invariant:
+//    Remaining boxes are always packed together with both
+//    pushers in contact. No gaps. Box positions are fully
+//    determined by pL and the box stacking order.
+//
+//    Box CG   = pL + (rank + 0.5) * BOX_WIDTH
+//    pR       = pL + N * BOX_WIDTH    (N = live box count)
+//
+//  Delivery model:
+//    The drone lands before each delivery. CG balance is only
+//    required in flight. The delivery sequence is:
+//      1. Land.
+//      2. Slide stack to position target box over hole.
+//      3. Open trapdoor servos. Box falls through.
+//      4. Close trapdoor servos.
+//      5. Compress remaining boxes, rebalance CG for flight.
+//      6. Take off.
+//
+//  Delivery order:
+//    Box 1 (center, heaviest) is delivered first since it
+//    starts over the hole. Remaining boxes are delivered in
+//    an order specified by the operator.
+//
+//  CG formula:
+//    xcg = (sum(mi * xi) + mRack * xRack) / (sum(mi) + mRack)
 // ============================================================
 
 #include <Arduino.h>
 #include <FastAccelStepper.h>
+#include <ESP32Servo.h>
 #include <cmath>
 #include "teeter_totter.h"
 #include "../shared/motion_config.h"
-
-// ── Module-private constants ──────────────────────────────────
-static constexpr int NUM_BOXES = 4;
 
 // ── Module-private globals ────────────────────────────────────
 static FastAccelStepperEngine engine;
 static FastAccelStepper* stepperL = nullptr;
 static FastAccelStepper* stepperR = nullptr;
 
-static float boxMass[NUM_BOXES]      = {0.0f, 0.0f, 0.0f, 0.0f};
-static bool  boxDelivered[NUM_BOXES] = {false, false, false, false};
-static float carriageL_in = LEFT_HOME_IN;
-static float carriageR_in = RIGHT_HOME_IN;
+static Servo servoL;
+static Servo servoR;
+
+static float boxMass[NUM_BOXES]      = {};
+static bool  boxDelivered[NUM_BOXES] = {};
+static float pusherL = PUSHER_L_HOME;
+static float pusherR = PUSHER_R_HOME;
 
 // ── Helpers ───────────────────────────────────────────────────
 static long inchesToSteps(float inches) {
@@ -49,147 +71,247 @@ static float clamp(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// ── Trapdoor control ──────────────────────────────────────────
+static void trapdoorOpen() {
+  servoL.write(SERVO_OPEN_DEG);
+  servoR.write(SERVO_OPEN_DEG);
+  Serial.println("[TRAPDOOR] Open.");
+}
+
+static void trapdoorClose() {
+  servoL.write(SERVO_CLOSED_DEG);
+  servoR.write(SERVO_CLOSED_DEG);
+  Serial.println("[TRAPDOOR] Closed.");
+}
+
+// ── Box geometry (compressed stack) ───────────────────────────
+// Rank: position among remaining boxes, counted from the left.
+static int boxRank(int idx) {
+  int rank = 0;
+  for (int i = 0; i < idx; i++) {
+    if (!boxDelivered[i]) rank++;
+  }
+  return rank;
+}
+
+static int liveBoxCount() {
+  int n = 0;
+  for (int i = 0; i < NUM_BOXES; i++) {
+    if (!boxDelivered[i]) n++;
+  }
+  return n;
+}
+
+static float boxCG(int idx, float pL) {
+  if (boxDelivered[idx]) return 0.0f;
+  return pL + (boxRank(idx) + 0.5f) * BOX_WIDTH_IN;
+}
+
 // ── CG calculation ────────────────────────────────────────────
-// Both boxes on a carriage share the carriage x-position (simplified).
-// Skips delivered boxes.
-static float computeCG(float leftPos, float rightPos) {
+static float computeCG(float pL) {
   float sumMX = RACK_MASS_KG * RACK_CG_IN;
   float sumM  = RACK_MASS_KG;
 
-  for (int i = 0; i < 2; i++) {
-    if (!boxDelivered[i]) { sumMX += boxMass[i] * leftPos;  sumM += boxMass[i]; }
-  }
-  for (int i = 2; i < NUM_BOXES; i++) {
-    if (!boxDelivered[i]) { sumMX += boxMass[i] * rightPos; sumM += boxMass[i]; }
+  for (int i = 0; i < NUM_BOXES; i++) {
+    if (!boxDelivered[i]) {
+      sumMX += boxMass[i] * boxCG(i, pL);
+      sumM  += boxMass[i];
+    }
   }
 
   if (sumM < 1e-6f) return SUPPORT_POINT_IN;
   return sumMX / sumM;
 }
 
-// ── Feedforward solver ────────────────────────────────────────
-// Solves for carriage positions that place xcg on SUPPORT_POINT_IN.
-// Constraint: keep current carriage separation fixed (both slide as a unit).
+// ── Balance solver ────────────────────────────────────────────
+// Solves for pL that places the loaded CG at the support point.
 //
-// Derivation:
-//   xcg*mT = mL*xL + mR*xR + mRack*xRack
-//   xR = xL + sep
-//   => xL = (xcg*mT - mRack*xRack - mR*sep) / (mL + mR)
-struct CarriageTargets { float left; float right; };
+//   SP * mT = mBoxes * pL + momentOffset + mRack * xRack
+//   pL = (SP * mT - momentOffset - mRack * xRack) / mBoxes
+//
+// where momentOffset = sum[ mi * (ri + 0.5) * BOX_WIDTH ]
+//
+struct PusherTargets { float left; float right; };
 
-static CarriageTargets solveCarriagePositions() {
-  float mL = 0.0f, mR = 0.0f;
-  for (int i = 0; i < 2; i++)         if (!boxDelivered[i]) mL += boxMass[i];
-  for (int i = 2; i < NUM_BOXES; i++) if (!boxDelivered[i]) mR += boxMass[i];
+static PusherTargets solveBalance() {
+  int N = liveBoxCount();
+  PusherTargets t = {pusherL, pusherR};
 
-  CarriageTargets t = {carriageL_in, carriageR_in};
-
-  if ((mL + mR) < 1e-6f) {
-    Serial.println("All boxes delivered — carriages stay in place.");
+  if (N == 0) {
+    Serial.println("All boxes delivered.");
     return t;
   }
 
-  float mT  = mL + mR + RACK_MASS_KG;
-  float sep = carriageR_in - carriageL_in;
-  float RHS = SUPPORT_POINT_IN * mT - RACK_MASS_KG * RACK_CG_IN - mR * sep;
+  float mBoxes = 0.0f;
+  float momentOffset = 0.0f;
 
-  t.left  = RHS / (mL + mR);
-  t.right = t.left + sep;
-  t.left  = clamp(t.left,  LEFT_CARRIAGE_MIN,  LEFT_CARRIAGE_MAX);
-  t.right = clamp(t.right, RIGHT_CARRIAGE_MIN, RIGHT_CARRIAGE_MAX);
+  for (int i = 0; i < NUM_BOXES; i++) {
+    if (!boxDelivered[i]) {
+      mBoxes += boxMass[i];
+      momentOffset += boxMass[i] * (boxRank(i) + 0.5f) * BOX_WIDTH_IN;
+    }
+  }
 
-  float achievedCG = computeCG(t.left, t.right);
-  Serial.printf("[SOLVER] Left=%.3f in  Right=%.3f in  →  CG=%.3f in  (target=%.3f in)\n",
-                t.left, t.right, achievedCG, SUPPORT_POINT_IN);
+  float mT = mBoxes + RACK_MASS_KG;
+  t.left  = (SUPPORT_POINT_IN * mT - momentOffset - RACK_MASS_KG * RACK_CG_IN) / mBoxes;
+  t.right = t.left + N * BOX_WIDTH_IN;
 
-  if (fabsf(achievedCG - SUPPORT_POINT_IN) > 0.5f) {
-    Serial.println("WARNING: Full CG correction not achievable — carriage at travel limit.");
-    Serial.println("         Adjust box placement or update SUPPORT_POINT_IN.");
+  float pLmax = PUSHER_R_MAX - N * BOX_WIDTH_IN;
+  t.left  = clamp(t.left, PUSHER_L_MIN, pLmax);
+  t.right = t.left + N * BOX_WIDTH_IN;
+
+  float achieved = computeCG(t.left);
+  Serial.printf("[BALANCE] pL=%.2f  pR=%.2f  CG=%.3f (target=%.3f, error=%+.3f)\n",
+                t.left, t.right, achieved, SUPPORT_POINT_IN,
+                achieved - SUPPORT_POINT_IN);
+
+  if (fabsf(achieved - SUPPORT_POINT_IN) > 0.5f) {
+    Serial.println("WARNING: CG correction limited by pusher travel.");
   }
 
   return t;
 }
 
-// ── Motor commands ────────────────────────────────────────────
-static void moveCarriageTo(FastAccelStepper* motor, float targetIn, const char* label) {
-  if (!motor) return;
-  motor->moveTo(inchesToSteps(targetIn));
-  Serial.printf("[MOVE] %s → %.3f in\n", label, targetIn);
+// ── Delivery positioning ──────────────────────────────────────
+// Slides the compressed stack so the target box is centered
+// over the drop hole. Called while the drone is on the ground.
+static bool solveDeliver(int idx, PusherTargets& t) {
+  if (boxDelivered[idx]) {
+    Serial.printf("Box %d already delivered.\n", idx);
+    return false;
+  }
+
+  if (idx != 1 && !boxDelivered[1]) {
+    Serial.println("Box 1 (center) must be delivered first.");
+    return false;
+  }
+
+  int N = liveBoxCount();
+  int r = boxRank(idx);
+
+  t.left  = HOLE_POS_IN - (r + 0.5f) * BOX_WIDTH_IN;
+  t.right = t.left + N * BOX_WIDTH_IN;
+
+  float pLmax = PUSHER_R_MAX - N * BOX_WIDTH_IN;
+  t.left  = clamp(t.left, PUSHER_L_MIN, pLmax);
+  t.right = t.left + N * BOX_WIDTH_IN;
+
+  float targetCG = boxCG(idx, t.left);
+  if (fabsf(targetCG - HOLE_POS_IN) > 0.5f) {
+    Serial.printf("WARNING: Box %d can only reach %.2f (hole at %.2f).\n",
+                  idx, targetCG, HOLE_POS_IN);
+  }
+
+  Serial.printf("[DELIVER] box %d -> hole  pL=%.2f  pR=%.2f\n", idx, t.left, t.right);
+  return true;
 }
 
-static void rebalance() {
-  Serial.println("\n── Rebalancing ──────────────────────────────────────────");
-  Serial.printf("CG before : %.3f in  (error = %+.3f in)\n",
-                computeCG(carriageL_in, carriageR_in),
-                computeCG(carriageL_in, carriageR_in) - SUPPORT_POINT_IN);
+// ── Motor commands ────────────────────────────────────────────
+static void movePusherTo(FastAccelStepper* motor, float targetIn, const char* label) {
+  if (!motor) return;
+  motor->moveTo(inchesToSteps(targetIn));
+  Serial.printf("[MOVE] %s -> %.3f in\n", label, targetIn);
+}
 
-  CarriageTargets targets = solveCarriagePositions();
-  moveCarriageTo(stepperL, targets.left,  "LEFT ");
-  moveCarriageTo(stepperR, targets.right, "RIGHT");
+// Both motors run concurrently via independent hardware timer
+// ISRs. Blocks until both reach their targets.
+static void executeMove(PusherTargets targets) {
+  movePusherTo(stepperL, targets.left,  "LEFT ");
+  movePusherTo(stepperR, targets.right, "RIGHT");
 
   unsigned long start = millis();
   while (stepperL->isRunning() || stepperR->isRunning()) {
     delay(10);
     if (millis() - start > 5000UL) {
-      Serial.println("WARNING: Rebalance timeout — forcing stop.");
+      Serial.println("WARNING: Move timeout -- forcing stop.");
       stepperL->forceStop();
       stepperR->forceStop();
       break;
     }
   }
 
-  carriageL_in = targets.left;
-  carriageR_in = targets.right;
+  pusherL = targets.left;
+  pusherR = targets.right;
+  Serial.printf("Move complete in %lu ms.\n", millis() - start);
+}
 
-  Serial.printf("CG after  : %.3f in  (error = %+.3f in)\n",
-                computeCG(carriageL_in, carriageR_in),
-                computeCG(carriageL_in, carriageR_in) - SUPPORT_POINT_IN);
-  Serial.printf("Done in %lu ms.\n", millis() - start);
-  Serial.println("─────────────────────────────────────────────────────────\n");
+// Compresses remaining boxes and rebalances CG for flight.
+static void rebalance() {
+  Serial.println("\n-- Compress + Rebalance --");
+  PusherTargets targets = solveBalance();
+  executeMove(targets);
+  Serial.printf("CG = %.3f in  (ready for flight)\n\n",
+                computeCG(pusherL));
+}
+
+// Full delivery sequence: open trapdoor, wait, close, mark, rebalance.
+static void deliverBox(int idx) {
+  if (boxDelivered[idx]) { Serial.printf("Box %d already delivered.\n", idx); return; }
+
+  Serial.printf("\n-- Delivering box %d (%.3f kg) --\n", idx, boxMass[idx]);
+
+  trapdoorOpen();
+  delay(DROP_DELAY_MS);
+  trapdoorClose();
+
+  boxDelivered[idx] = true;
+  Serial.printf("Box %d delivered.\n", idx);
+  rebalance();
 }
 
 // ── Serial UI ─────────────────────────────────────────────────
 static void promptForMasses() {
   Serial.println("\n=== Enter box masses (kg). Press Enter after each. ===");
-  Serial.println("    REMINDER: Load heaviest box nearest center before flight.");
+  Serial.println("    Layout: [box0 left][box1 center][box2 right]");
+  Serial.println("    Box 1 (center) should be heaviest.");
   for (int i = 0; i < NUM_BOXES; i++) {
     boxDelivered[i] = false;
     Serial.printf("Box %d mass (kg): ", i);
     while (Serial.available() == 0) delay(10);
     boxMass[i] = Serial.parseFloat();
     while (Serial.available() && Serial.peek() == '\n') Serial.read();
-    Serial.printf("  → %.3f kg\n", boxMass[i]);
+    Serial.printf("  -> %.3f kg\n", boxMass[i]);
   }
   Serial.println("Masses recorded.");
 }
 
 static void printStatus() {
-  Serial.println("\n── Status ───────────────────────────────────────────────");
+  int N = liveBoxCount();
+  Serial.println("\n-- Status --");
   for (int i = 0; i < NUM_BOXES; i++) {
-    Serial.printf("  Box %d : %.3f kg  %s\n", i, boxMass[i],
-                  boxDelivered[i] ? "[DELIVERED]" : "[on rack]");
+    if (boxDelivered[i]) {
+      Serial.printf("  Box %d : %.3f kg  [DELIVERED]\n", i, boxMass[i]);
+    } else {
+      Serial.printf("  Box %d : %.3f kg  @ %.2f in  (rank %d)\n",
+                    i, boxMass[i], boxCG(i, pusherL), boxRank(i));
+    }
   }
-  Serial.printf("  Left  carriage : %.3f in\n", carriageL_in);
-  Serial.printf("  Right carriage : %.3f in\n", carriageR_in);
-  Serial.printf("  Current CG     : %.3f in  (target = %.3f in)\n",
-                computeCG(carriageL_in, carriageR_in), SUPPORT_POINT_IN);
-  Serial.println("─────────────────────────────────────────────────────────\n");
+  Serial.printf("  Left  pusher : %.2f in\n", pusherL);
+  Serial.printf("  Right pusher : %.2f in\n", pusherR);
+  Serial.printf("  Stack        : %.1f in  (%d boxes)\n", N * BOX_WIDTH_IN, N);
+  Serial.printf("  CG           : %.3f in  (target %.3f)\n\n",
+                computeCG(pusherL), SUPPORT_POINT_IN);
 }
 
 static void printHelp() {
   Serial.println("\nCommands:");
-  Serial.println("  r       — rebalance now");
-  Serial.println("  d<0-3>  — mark box as delivered, rebalance (e.g. 'd2')");
-  Serial.println("  m       — re-enter all box masses");
-  Serial.println("  s       — emergency stop");
-  Serial.println("  p       — print status");
-  Serial.println("  ?       — this help\n");
+  Serial.println("  r       -- compress + rebalance for flight");
+  Serial.println("  h<0-2>  -- slide box to drop hole (e.g. 'h2')");
+  Serial.println("  d<0-2>  -- open trapdoor, drop box, rebalance (e.g. 'd1')");
+  Serial.println("  o       -- open trapdoor (test)");
+  Serial.println("  c       -- close trapdoor (test)");
+  Serial.println("  m       -- re-enter box masses");
+  Serial.println("  s       -- emergency stop");
+  Serial.println("  p       -- print status");
+  Serial.println("  ?       -- help");
+  Serial.println("\nDelivery flow: h1 -> d1 -> h_ -> d_ -> h_ -> d_\n");
 }
 
 // ── Public setup / loop ───────────────────────────────────────
 void teeterTotterSetup() {
   Serial.println("\n=== Skycart Teeter-Totter Balance Firmware ===");
 
+  // Stepper motors
   engine.init();
   stepperL = engine.stepperConnectToPin(STEP_PIN_L);
   stepperR = engine.stepperConnectToPin(STEP_PIN_R);
@@ -205,11 +327,17 @@ void teeterTotterSetup() {
     s->setSpeedInHz(BALANCE_SPEED_HZ);
     s->setAcceleration(BALANCE_ACCEL);
     s->setCurrentPosition(inchesToSteps(homeIn));
-    Serial.printf("%s stepper initialized (home = %.1f in).\n", label, homeIn);
+    Serial.printf("%s stepper init (home = %.1f in)\n", label, homeIn);
   };
 
-  initMotor(stepperL, DIR_PIN_L, ENABLE_PIN_L, LEFT_HOME_IN,  "LEFT ");
-  initMotor(stepperR, DIR_PIN_R, ENABLE_PIN_R, RIGHT_HOME_IN, "RIGHT");
+  initMotor(stepperL, DIR_PIN_L, ENABLE_PIN_L, PUSHER_L_HOME, "LEFT ");
+  initMotor(stepperR, DIR_PIN_R, ENABLE_PIN_R, PUSHER_R_HOME, "RIGHT");
+
+  // Trapdoor servos
+  servoL.attach(SERVO_L_PIN);
+  servoR.attach(SERVO_R_PIN);
+  trapdoorClose();
+  Serial.println("Trapdoor servos initialized (closed).");
 
   promptForMasses();
   printHelp();
@@ -224,21 +352,38 @@ void teeterTotterLoop() {
   switch (cmd) {
     case 'r': case 'R': rebalance(); break;
 
+    case 'h': case 'H': {
+      unsigned long t = millis();
+      while (Serial.available() == 0 && millis() - t < 2000) delay(10);
+      if (Serial.available() == 0) { Serial.println("No box index."); break; }
+      int idx = Serial.read() - '0';
+      if (idx < 0 || idx >= NUM_BOXES) {
+        Serial.printf("Invalid index. Use 0-%d.\n", NUM_BOXES - 1);
+        break;
+      }
+      PusherTargets targets;
+      if (solveDeliver(idx, targets)) {
+        executeMove(targets);
+        Serial.printf("Box %d over hole. Send 'd%d' to drop.\n", idx, idx);
+      }
+      break;
+    }
+
     case 'd': case 'D': {
       unsigned long t = millis();
       while (Serial.available() == 0 && millis() - t < 2000) delay(10);
-      if (Serial.available() == 0) { Serial.println("No box index received."); break; }
+      if (Serial.available() == 0) { Serial.println("No box index."); break; }
       int idx = Serial.read() - '0';
       if (idx < 0 || idx >= NUM_BOXES) {
-        Serial.printf("Invalid box index. Use 0–%d.\n", NUM_BOXES - 1);
+        Serial.printf("Invalid index. Use 0-%d.\n", NUM_BOXES - 1);
         break;
       }
-      if (boxDelivered[idx]) { Serial.printf("Box %d already delivered.\n", idx); break; }
-      boxDelivered[idx] = true;
-      Serial.printf("Box %d delivered (%.3f kg removed).\n", idx, boxMass[idx]);
-      rebalance();
+      deliverBox(idx);
       break;
     }
+
+    case 'o': case 'O': trapdoorOpen();  break;
+    case 'c': case 'C': trapdoorClose(); break;
 
     case 'm': case 'M':
       stepperL->forceStop();
@@ -250,6 +395,7 @@ void teeterTotterLoop() {
     case 's': case 'S':
       stepperL->forceStop();
       stepperR->forceStop();
+      trapdoorClose();
       Serial.println("EMERGENCY STOP.");
       break;
 
